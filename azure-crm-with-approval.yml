@@ -1,0 +1,130 @@
+trigger: none
+
+pool:
+  vmImage: windows-latest
+
+parameters:
+- name: solutionName
+  displayName: Select Solution
+  type: string
+  default: febsolution
+  values: [none, febsolution, pulse36, BioBank, Bots, App, G42]
+- name: targetEnvironment
+  displayName: Target Environment
+  type: string
+  default: UAT
+  values: [UAT, PROD]
+
+variables:
+  # Base Service Connection Names
+  devConn: 'power-app-serviceconnecton-mazik-ai'
+  uatConn: 'uat-service-connection' 
+  #prodConn: 'power-app-serviceconnecton-prod'
+
+  # Logic to pick the correct connection for the deployment stage
+  ${{ if eq(parameters.targetEnvironment, 'UAT') }}:
+    currenttargetConn: 'uat-service-connection'
+  ${{ if eq(parameters.targetEnvironment, 'PROD') }}:
+    currenttargetConn: 'power-app-serviceconnecton-prod'
+
+  backupBranch: 'backup'
+  backupFolder: 'Backups'
+
+stages:
+# ────────────────────────────────────────────────
+# STAGE 1: BUILD + BACKUP
+# ────────────────────────────────────────────────
+- stage: BuildAndBackup
+  displayName: "Build and Backup"
+  jobs:
+  - job: ExportJob
+    steps:
+    - checkout: self
+      persistCredentials: true
+      clean: true
+
+    - task: PowerPlatformToolInstaller@2
+      displayName: Install Power Platform Tools
+
+    - task: PowerPlatformExportSolution@2
+      displayName: Export Managed Solution
+      inputs:
+        authenticationType: PowerPlatformSPN
+        PowerPlatformSPN: $(devConn)
+        SolutionName: ${{ parameters.solutionName }}
+        SolutionOutputFile: $(Build.ArtifactStagingDirectory)/${{ parameters.solutionName }}_managed.zip
+        Managed: true
+
+    - script: |
+        git config --global user.email "azuredevops@pipeline.com"
+        git config --global user.name "Azure DevOps Pipeline"
+        git fetch origin
+        git checkout $(backupBranch) || git checkout -b $(backupBranch)
+        if not exist "$(Build.SourcesDirectory)\$(backupFolder)\${{ parameters.solutionName }}" mkdir "$(Build.SourcesDirectory)\$(backupFolder)\${{ parameters.solutionName }}"
+        copy "$(Build.ArtifactStagingDirectory)\${{ parameters.solutionName }}_managed.zip" "$(Build.SourcesDirectory)\$(backupFolder)\${{ parameters.solutionName }}\${{ parameters.solutionName }}_managed_$(Build.BuildId).zip"
+        git add .
+        git commit -m "Backup ${{ parameters.solutionName }} - Build $(Build.BuildId) [skip ci]" || echo "Nothing to commit"
+        git -c http.extraheader="AUTHORIZATION: bearer $(System.AccessToken)" push origin $(backupBranch)
+      displayName: Save Backup to Git Branch
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      continueOnError: true
+
+    - publish: $(Build.ArtifactStagingDirectory)/${{ parameters.solutionName }}_managed.zip
+      artifact: managed_zip
+
+# ────────────────────────────────────────────────
+# STAGE 2: DEPLOY (UAT or PROD)
+# ────────────────────────────────────────────────
+- stage: Deploy
+  displayName: "Deploy to ${{ parameters.targetEnvironment }}"
+  dependsOn: BuildAndBackup
+  condition: succeeded()
+  jobs:
+  - deployment: DeployJob
+    # Target environment for Approval Gates
+    environment: '${{ parameters.targetEnvironment }}' 
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: PowerPlatformToolInstaller@2
+            displayName: Install Tools
+
+          # PRIMARY ATTEMPT: Optimized for Upgrades
+          - task: PowerPlatformImportSolution@2
+            name: Import_Upgrade
+            displayName: 'Import Solution (Stage & Upgrade)'
+            inputs:
+              authenticationType: PowerPlatformSPN
+              PowerPlatformSPN: $(currenttargetConn)
+              SolutionInputFile: '$(Pipeline.Workspace)/managed_zip/${{ parameters.solutionName }}_managed.zip'
+              AsyncOperation: true
+              MaxAsyncWaitTime: '60'           
+              StageAndUpgrade: true
+              OverwriteUnmanagedCustomizations: false
+              ActivatePlugins: true
+              PublishWorkflows: true
+
+          # FALLBACK ATTEMPT: Triggered only if Primary fails (e.g., missing base solution)
+          - task: PowerPlatformImportSolution@2
+            name: Import_Fallback
+            displayName: 'Fallback: Force Import (Update mode)'
+            condition: failed() # Triggers if Import_Upgrade fails
+            inputs:
+              authenticationType: 'PowerPlatformSPN'
+              PowerPlatformSPN: '$(currenttargetConn)'
+              SolutionInputFile: '$(Pipeline.Workspace)/managed_zip/${{ parameters.solutionName }}_managed.zip'
+              AsyncOperation: true
+              MaxAsyncWaitTime: '60'
+              OverwriteUnmanagedCustomizations: true
+              ConvertToManaged: true
+              PublishWorkflows: true
+
+          # FINAL STEP: Ensure environment is published
+          - task: PowerPlatformPublishCustomizations@2
+            displayName: 'Final Publish'
+            condition: always() # Runs regardless of which import step succeeded
+            inputs:
+              authenticationType: PowerPlatformSPN
+              PowerPlatformSPN: $(currenttargetConn)
