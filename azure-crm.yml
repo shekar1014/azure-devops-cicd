@@ -1,0 +1,82 @@
+trigger: none
+
+pool:
+  vmImage: windows-latest
+
+parameters:
+- name: solutionName
+  displayName: Select Solution
+  type: string
+  default: maziktestsolution
+  values: [none, maziktestsolution, newpulse, BioBank, Bots, App, G42]
+- name: targetEnvironment
+  displayName: Target Environment
+  type: string
+  default: UAT
+  values: [UAT, PROD]
+
+variables:
+  # Service Connection Names (Ensure these match your Project Settings)
+  devConn: 'power-app-serviceconnecton-mazik-ai'
+  uatConn: 'power-app-serviceconnecton-mazik-ai' 
+  # prodConn: 'power-app-prod-connection'
+
+  backupBranch: 'backup'
+  backupFolder: 'Backups'
+
+stages:
+# STAGE 1: BUILD (Export from Dev & Backup to Git)
+- stage: BuildAndBackup
+  displayName: "Build and Backup"
+  jobs:
+  - job: ExportJob
+    steps:
+    - checkout: self
+      persistCredentials: true
+      clean: true
+
+    - task: PowerPlatformToolInstaller@2
+      displayName: Install Power Platform Tools
+
+    - task: PowerPlatformPublishCustomizations@2
+      displayName: Publish in DEV (Ensures latest tables are included)
+      inputs:
+        authenticationType: PowerPlatformSPN
+        PowerPlatformSPN: $(devConn)
+
+    - task: PowerPlatformExportSolution@2
+      displayName: Export Managed Solution
+      inputs:
+        authenticationType: PowerPlatformSPN
+        PowerPlatformSPN: $(devConn)
+        SolutionName: ${{ parameters.solutionName }}
+        SolutionOutputFile: $(Build.ArtifactStagingDirectory)\${{ parameters.solutionName }}_managed.zip
+        Managed: true
+
+    - script: |
+        git config --global user.email "azuredevops@pipeline.com"
+        git config --global user.name "Azure DevOps Pipeline"
+        git fetch origin
+        git checkout $(backupBranch) || git checkout -b $(backupBranch)
+        if not exist "$(Build.SourcesDirectory)\$(backupFolder)\${{ parameters.solutionName }}" mkdir "$(Build.SourcesDirectory)\$(backupFolder)\${{ parameters.solutionName }}"
+        copy "$(Build.ArtifactStagingDirectory)\${{ parameters.solutionName }}_managed.zip" "$(Build.SourcesDirectory)\$(backupFolder)\${{ parameters.solutionName }}\${{ parameters.solutionName }}_managed_$(Build.BuildId).zip"
+        git add .
+        git commit -m "Backup ${{ parameters.solutionName }} - Build $(Build.BuildId) [skip ci]"
+        git -c http.extraheader="AUTHORIZATION: bearer $(System.AccessToken)" push origin $(backupBranch)
+      displayName: Save Backup to Git
+      env:
+        SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      continueOnError: true
+
+    - publish: $(Build.ArtifactStagingDirectory)\${{ parameters.solutionName }}_managed.zip
+      artifact: managed_zip
+
+# STAGE 2: DEPLOY (UAT or PROD)
+- stage: Deploy
+  displayName: "Deploy to ${{ parameters.targetEnvironment }}"
+  dependsOn: BuildAndBackup
+  condition: succeeded()
+  jobs:
+  - deployment: DeployJob
+    # IMPORTANT: Go to Pipelines > Environments and create 'UAT' and 'PROD' to enable Approvals
+    environment: '${{
